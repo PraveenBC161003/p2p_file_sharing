@@ -6,23 +6,17 @@ from concurrent.futures import ThreadPoolExecutor
 from utils.logger import get_logger
 from network.protocol import recv_message
 
-log = get_logger("Server") # Logger instance for this module
+log = get_logger("Server")
 
-# Type alias for handler functions
-Handler = Callable[[socket.socket, dict], None] # Handler = "function signature definition"
-
+Handler = Callable[[socket.socket, dict], None]
 
 class PeerServer:
     def __init__(self, host: str = "0.0.0.0", port: int = 5000, max_workers: int = 10):
         self.host = host
         self.port = port
-
         self.handlers: Dict[str, Handler] = {}
-
         self.running = False
         self.server_socket: Optional[socket.socket] = None
-
-        # Thread pool for handling clients
         self.pool = ThreadPoolExecutor(max_workers=max_workers)
 
     def register_handler(self, msg_type: str, handler: Handler):
@@ -31,20 +25,13 @@ class PeerServer:
 
     def start(self):
         self.running = True
-
         thread = threading.Thread(target=self._run, daemon=True)
         thread.start()
-
         log.success(f"Server starting on {self.host}:{self.port}")
-
 
     def _run(self):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-        # Allow quick restart
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-        # Prevent blocking forever
         self.server_socket.settimeout(1.0)
 
         try:
@@ -61,12 +48,10 @@ class PeerServer:
             try:
                 conn, addr = self.server_socket.accept()
                 log.info(f"New connection from {addr}")
-
-                # Submit to thread pool instead of unlimited threads
                 self.pool.submit(self._handle_client, conn, addr)
 
             except socket.timeout:
-                continue  # allows graceful shutdown
+                continue
 
             except Exception as e:
                 log.error(f"Accept error: {e}")
@@ -77,17 +62,19 @@ class PeerServer:
                 message = recv_message(conn)
 
                 if not isinstance(message, dict):
-                    log.warn(f"Invalid message format from {addr}")
+                    log.warning(f"Invalid message format from {addr}")
                     continue
 
                 msg_type = message.get("type")
-
                 if not msg_type:
-                    log.warn(f"Message without type from {addr}")
+                    log.warning(f"Message without type from {addr}")
                     continue
 
-                handler = self.handlers.get(msg_type)
+                # Inject requester IP so handlers (e.g. file_service) can show
+                # the peer's address in approval prompts without needing the socket.
+                message["_requester_ip"] = addr[0]
 
+                handler = self.handlers.get(msg_type)
                 if handler:
                     try:
                         log.debug(f"Handling {msg_type} from {addr}")
@@ -95,10 +82,10 @@ class PeerServer:
                     except Exception as e:
                         log.error(f"Handler error ({msg_type}) from {addr}: {e}")
                 else:
-                    log.warn(f"No handler for message type: {msg_type}")
+                    log.warning(f"No handler for message type: {msg_type}")
 
         except Exception as e:
-            log.warn(f"Connection closed: {addr} ({e})")
+            log.warning(f"Connection closed: {addr} ({e})")
 
         finally:
             try:
@@ -114,7 +101,6 @@ class PeerServer:
                 self.server_socket.shutdown(socket.SHUT_RDWR)
             except Exception:
                 pass
-
             try:
                 self.server_socket.close()
             except Exception:
