@@ -3,7 +3,6 @@ from network.client import PeerClient
 
 log = get_logger("DiscoveryService")
 
-
 class DiscoveryService:
     def __init__(self, port: int, tracker_host: str, tracker_port: int):
         self.port = port
@@ -20,7 +19,7 @@ class DiscoveryService:
 
             message = {
                 "type": "REGISTER",
-                "port": self.port
+                "port": self.port,
             }
 
             response = client.send_and_receive(message)
