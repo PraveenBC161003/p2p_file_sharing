@@ -6,7 +6,7 @@ log = get_logger("DiscoveryService")
 
 class DiscoveryService:
     def __init__(self, port: int, tracker_host: str, tracker_port: int):
-        self.port = port = 
+        self.port = port
         self.tracker_host = tracker_host
         self.tracker_port = tracker_port
 
