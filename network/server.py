@@ -1,0 +1,124 @@
+import socket
+import threading
+from typing import Callable, Dict, Optional
+from concurrent.futures import ThreadPoolExecutor
+
+from utils.logger import get_logger
+from network.protocol import recv_message
+
+log = get_logger("Server") # Logger instance for this module
+
+# Type alias for handler functions
+Handler = Callable[[socket.socket, dict], None] # Handler = "function signature definition"
+
+
+class PeerServer:
+    def __init__(self, host: str = "0.0.0.0", port: int = 5000, max_workers: int = 10):
+        self.host = host
+        self.port = port
+
+        self.handlers: Dict[str, Handler] = {}
+
+        self.running = False
+        self.server_socket: Optional[socket.socket] = None
+
+        # Thread pool for handling clients
+        self.pool = ThreadPoolExecutor(max_workers=max_workers)
+
+    def register_handler(self, msg_type: str, handler: Handler):
+        self.handlers[msg_type] = handler
+        log.debug(f"Handler registered for {msg_type}")
+
+    def start(self):
+        self.running = True
+
+        thread = threading.Thread(target=self._run, daemon=True)
+        thread.start()
+
+        log.success(f"Server starting on {self.host}:{self.port}")
+
+
+    def _run(self):
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+        # Allow quick restart
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        # Prevent blocking forever
+        self.server_socket.settimeout(1.0)
+
+        try:
+            self.server_socket.bind((self.host, self.port))
+        except OSError as e:
+            log.error(f"Failed to bind {self.host}:{self.port} → {e}")
+            self.running = False
+            return
+
+        self.server_socket.listen(50)
+        log.info("Listening for incoming connections...")
+
+        while self.running:
+            try:
+                conn, addr = self.server_socket.accept()
+                log.info(f"New connection from {addr}")
+
+                # Submit to thread pool instead of unlimited threads
+                self.pool.submit(self._handle_client, conn, addr)
+
+            except socket.timeout:
+                continue  # allows graceful shutdown
+
+            except Exception as e:
+                log.error(f"Accept error: {e}")
+
+    def _handle_client(self, conn: socket.socket, addr):
+        try:
+            while self.running:
+                message = recv_message(conn)
+
+                if not isinstance(message, dict):
+                    log.warn(f"Invalid message format from {addr}")
+                    continue
+
+                msg_type = message.get("type")
+
+                if not msg_type:
+                    log.warn(f"Message without type from {addr}")
+                    continue
+
+                handler = self.handlers.get(msg_type)
+
+                if handler:
+                    try:
+                        log.debug(f"Handling {msg_type} from {addr}")
+                        handler(conn, message)
+                    except Exception as e:
+                        log.error(f"Handler error ({msg_type}) from {addr}: {e}")
+                else:
+                    log.warn(f"No handler for message type: {msg_type}")
+
+        except Exception as e:
+            log.warn(f"Connection closed: {addr} ({e})")
+
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def stop(self):
+        self.running = False
+
+        if self.server_socket:
+            try:
+                self.server_socket.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+
+            try:
+                self.server_socket.close()
+            except Exception:
+                pass
+
+        self.pool.shutdown(wait=False)
+        log.info("Server stopped")
