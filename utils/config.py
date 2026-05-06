@@ -29,7 +29,7 @@ BACKLOG: int = 5
 SOCKET_TIMEOUT: float = 30.0
 
 
-# Chunk size for file transfer (512 KB)
+# Chunk size for file transfer (5`12` KB)
 CHUNK_SIZE: int = 512 * 1024
 
 # Timeout while waiting for next chunk

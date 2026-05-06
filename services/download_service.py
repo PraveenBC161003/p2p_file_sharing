@@ -1,8 +1,9 @@
+import hashlib
 import base64
 from pathlib import Path
 
 from utils.logger import get_logger
-from utils.config import DOWNLOADS_DIR
+from utils.config import DOWNLOADS_DIR, CHUNK_SIZE
 
 from network.client import PeerClient
 from network.protocol import make_request_file
@@ -11,68 +12,118 @@ log = get_logger("DownloadService")
 
 
 class DownloadService:
-    # Initialization -> Ensures a folder exists for downloads. This prevents crash when saving files, Makes system ready before any download starts.
-    # Basically a silent setup to avoid runtime errors
     def __init__(self):
         DOWNLOADS_DIR.mkdir(exist_ok=True)
 
-    def download_file(self, host: str, port: int, filename: str): # This is the orchestrator method that manages the entire download process. 
-        # It abstracts away the complexities of network communication and file handling, providing a simple interface for initiating downloads.
-        # self -> current object instance
-        # host -> IP/hostname of the peer
-        # port -> peer's listening port
-        # filename -> file you want to download from the peer -> This is the entry point for downloading a file
-
+    def download_file(self, host: str, port: int, filename: str):
         client = PeerClient(host, port)
-        # Creates a client object to communicate with another peer, Stores target peer details (host + port)
 
         try:
-            client.connect() # Opens a socket connection to the peer, Establishes communication channel -> No data exchange is possible without this
+            client.connect()
 
-            # Step 1: Send request
-            client.send(make_request_file(filename)) # creates request message and sends it to the peer. {"type": "REQUEST_FILE", "filename": "file.txt"} 
-            # Basically -> Do you allow me to download this file?
+            # Step 1: Send download request to peer
+            client.send(make_request_file(filename))
 
-            # Step 2: Wait for approval
-            response = client.receive() # Waits for peer's reply and Stores response message -> This is a blocking call, The peer must respond for the download to proceed.
-            
-            if response["type"] == "REJECTED": # Checks if the peer denied the request
-                log.warn(f"Download rejected: {response.get('reason')}")
+            # Step 2: Wait for approval or rejection
+            response = client.receive()
+
+            if response["type"] == "REJECTED":
+                # Peer explicitly refused — log the reason and stop
+                log.warning(f"Download rejected: {response.get('reason')}")
                 return
 
-            if response["type"] != "APPROVED": # Handles unexpected responses 
-                log.error("Unexpected response")
+            if response["type"] != "APPROVED":
+                # Received something unexpected instead of APPROVED/REJECTED — abort
+                log.error(f"Unexpected response type: {response.get('type')}")
                 return
 
-            log.info(f"Download approved: {filename}") # Confirms peer accepted the request, Signals start of transfer phase
+            # Extract metadata from approval message
+            expected_size     = response.get("size")
+            expected_checksum = response.get("checksum")
 
-            # Step 3: Receive file
-            self._receive_file(client, filename)
+            if not expected_checksum:
+                # Sender did not provide a checksum — cannot verify integrity after download
+                log.error("APPROVED message missing checksum — aborting for safety")
+                return
+
+            log.info(f"Download approved: {filename} ({expected_size} bytes)")
+
+            # Step 3: Receive chunks and write to disk
+            self._receive_file(client, filename, expected_checksum)
 
         finally:
             client.close()
 
-    def _receive_file(self, client: PeerClient, filename: str):
-        # client -> active connection to peer
-        # filename -> name of file to save
-        # Called only after download is approved
+    def _receive_file(self, client: PeerClient, filename: str, expected_checksum: str):
+        output_path = DOWNLOADS_DIR / filename
 
-        output_path = DOWNLOADS_DIR / filename # Decides where the file will be stored
+        # Tracks received chunks by index to detect gaps or out-of-order delivery
+        received_chunks: dict[int, bytes] = {}
 
-        with output_path.open("wb") as f: # Opens file in write binary mode, It ensures binary safe warnings, overwrite existing files. This prepares file for writing chunks
+        while True:
+            message = client.receive()
+            msg_type = message.get("type")
 
-            while True: # Loops until the transfer is complete.
-                message = client.receive() # Extracts message type safely, also prevents crash if "type" is missing
+            if msg_type == "FILE_CHUNK":
+                index = message.get("index")
+                raw   = message.get("data")
 
-                msg_type = message.get("type")
+                if index is None or raw is None:
+                    # Malformed chunk — skip and keep going rather than crashing
+                    log.warning("Received malformed FILE_CHUNK (missing index or data), skipping")
+                    continue
 
-                if msg_type == "FILE_CHUNK":
-                    data = base64.b64decode(message["data"]) # base62 - Original binary data is encoded to text for safe transmission, Now we decode it back to binary before writing to disk
-                    f.write(data)
+                # Decode base64 back to original binary bytes
+                chunk_bytes = base64.b64decode(raw)
+                received_chunks[index] = chunk_bytes
+                log.debug(f"Received chunk {index}")
 
-                elif msg_type == "TRANSFER_DONE":
-                    log.success(f"Download complete: {filename}")
-                    break # Exits loop -> File is fully reconstructed and saved
+            elif msg_type == "TRANSFER_DONE":
+                # All chunks received — now reassemble in correct order
+                if not received_chunks:
+                    log.error("TRANSFER_DONE received but no chunks were collected")
+                    return
 
-                else:
-                    log.warn(f"Unexpected message: {msg_type}") # Handles unknown message types
+                # Sort by chunk index to reconstruct the file in the original order
+                ordered_chunks = [received_chunks[i] for i in sorted(received_chunks)]
+
+                # Verify there are no gaps in chunk sequence
+                expected_indices = set(range(len(received_chunks)))
+                actual_indices   = set(received_chunks.keys())
+
+                if expected_indices != actual_indices:
+                    missing = expected_indices - actual_indices
+                    log.error(f"Missing chunks: {missing} — file may be corrupt")
+                    return
+
+                # Write assembled file to disk
+                with output_path.open("wb") as f:
+                    for chunk in ordered_chunks:
+                        f.write(chunk)
+
+                # Verify checksum against what the sender promised in APPROVED
+                actual_checksum = self._compute_checksum(output_path)
+
+                if actual_checksum != expected_checksum:
+                    log.error(
+                        f"Checksum mismatch for '{filename}' — "
+                        f"expected {expected_checksum}, got {actual_checksum}. "
+                        f"Deleting corrupt file."
+                    )
+                    output_path.unlink(missing_ok=True)
+                    return
+
+                log.success(f"Download complete and verified: {filename}")
+                break
+
+            else:
+                # Unknown message type mid-transfer — log but keep going
+                log.warning(f"Unexpected message during transfer: {msg_type}")
+
+    def _compute_checksum(self, file_path: Path) -> str:
+        # Must match the algorithm used in FileService._compute_checksum (sha256)
+        h = hashlib.sha256()
+        with file_path.open("rb") as f:
+            for chunk in iter(lambda: f.read(CHUNK_SIZE), b""):
+                h.update(chunk)
+        return h.hexdigest()
