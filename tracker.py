@@ -10,8 +10,6 @@ log = get_logger("Tracker")
 # How long (seconds) a peer registration stays valid without a heartbeat.
 # Peers should re-register before this window expires (e.g. every 30 s).
 PEER_TTL = 90.0
-
-
 class Tracker:
     def __init__(self, host="0.0.0.0", port=5002):
         self.host = host
@@ -25,7 +23,7 @@ class Tracker:
         self.server_socket = None
         self._peers_lock = threading.Lock()
 
-    # ── Lifecycle ─────────────────────────────────────────────────────────────
+    # Lifecycle 
 
     def start(self):
         self.running = True
@@ -77,10 +75,9 @@ class Tracker:
                 pass
         log.info("Tracker stopped")
 
-    # ── Reaper ────────────────────────────────────────────────────────────────
+    # Reaper 
 
     def _reap_dead_peers(self):
-        """Periodically remove peers that have not refreshed their TTL."""
         while self.running:
             time.sleep(PEER_TTL / 3)   # check three times per TTL window
             now = time.time()
@@ -90,10 +87,7 @@ class Tracker:
                     del self.peers[key]
                     log.info(f"Expired peer: {key[0]}:{key[1]}")
 
-    # ── Client handler ────────────────────────────────────────────────────────
-
     def _handle_client(self, conn: socket.socket, addr):
-        """Handle one tracker client request (one message per connection)."""
         ip = addr[0]
 
         try:
@@ -101,7 +95,7 @@ class Tracker:
             message = recv_message(conn)
             msg_type = message.get("type")
 
-            # ── REGISTER ────────────────────────────────────────────────────
+            # REGISTER 
             if msg_type == "REGISTER":
                 port = message.get("port")
 
@@ -117,7 +111,7 @@ class Tracker:
                 log.success(f"Registered: {ip}:{port}  (total peers: {total})")
                 send_message(conn, {"type": "ACK"})
 
-            # ── GET_PEERS ────────────────────────────────────────────────────
+            # GET_PEERS
             elif msg_type == "GET_PEERS":
                 with self._peers_lock:
                     peer_list = [
@@ -131,7 +125,7 @@ class Tracker:
                     "peers": peer_list,
                 })
 
-            # ── DEREGISTER ──────────────────────────────────────────────────
+            # DEREGISTER
             elif msg_type == "DEREGISTER":
                 port = message.get("port")
 
@@ -145,7 +139,7 @@ class Tracker:
 
                 send_message(conn, {"type": "ACK"})
 
-            # ── HEARTBEAT (keep-alive; renews TTL without full re-register) ──
+            # HEARTBEAT
             elif msg_type == "HEARTBEAT":
                 port = message.get("port")
 

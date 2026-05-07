@@ -32,11 +32,11 @@ class DownloadService:
             log.info(f"Connecting to {host}:{port} to download {filename!r}")
             client.connect()
 
-            # ── Step 1: Send download request ────────────────────────────────
+            # Step 1: Send download request
             log.debug("Sending REQUEST_FILE...")
             client.send(make_request_file(filename))
 
-            # ── Step 2: Wait for approval or rejection ────────────────────────
+            # Step 2: Wait for approval or rejection
             # The remote peer's CLI user may take time to approve — use the
             # full TRANSFER_TIMEOUT here so we don't bail out prematurely.
             log.debug("Waiting for peer to approve/reject...")
@@ -54,7 +54,7 @@ class DownloadService:
                 )
                 return
 
-            # ── Step 3: Parse approval metadata ──────────────────────────────
+            # Step 3: Parse approval metadata
             expected_size     = response.get("size")
             expected_checksum = response.get("checksum")
 
@@ -68,7 +68,7 @@ class DownloadService:
                 f"({format_bytes(expected_size) if expected_size else 'unknown size'})"
             )
 
-            # ── Step 4: Receive chunks and reassemble ─────────────────────────
+            # Step 4: Receive chunks and reassemble
             self._receive_file(client, filename, expected_size, expected_checksum)
 
         except ConnectionError as e:
@@ -165,7 +165,7 @@ class DownloadService:
 
                     log.info(f"File written to: {output_path}")
 
-                    # ── Verify size ───────────────────────────────────────────
+                    # Verify size 
                     actual_size = output_path.stat().st_size
                     if expected_size is not None and actual_size != expected_size:
                         log.error(
@@ -176,7 +176,7 @@ class DownloadService:
                         output_path.unlink(missing_ok=True)
                         return
 
-                    # ── Verify checksum ───────────────────────────────────────
+                    # Verify checksum 
                     log.info("Verifying integrity (SHA-256)...")
                     actual_checksum = self._compute_checksum(output_path)
 

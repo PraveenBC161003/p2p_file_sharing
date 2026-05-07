@@ -13,14 +13,12 @@ log = get_logger("Node")
 # How often to automatically refresh the peer list and remote file cache (seconds).
 # Keeps the node up-to-date as new peers join/leave the network.
 AUTO_REFRESH_INTERVAL = 60.0
-
-
 class P2PNode:
 
     def __init__(self, port: int, tracker_host: str, tracker_port: int):
         self.port = port
 
-        # ── Core components ───────────────────────────────────────────────────
+        # Core components 
         self.server = PeerServer(port=port)
         self.file_service = FileService()
         self.download_service = DownloadService()
@@ -32,16 +30,14 @@ class P2PNode:
 
         self.running = False
 
-        # ── Remote file cache ─────────────────────────────────────────────────
-        # Structure: { "host:port" -> { "peer_index": int, "host": str,
-        #                               "port": int, "files": [...] } }
+        # Remote file cache
         self._remote_files_cache: dict[str, dict] = {}
         self._remote_files_lock = threading.Lock()
 
         # Background refresh thread
         self._refresh_thread: threading.Thread | None = None
 
-    # ── Lifecycle ─────────────────────────────────────────────────────────────
+    # Lifecycle
 
     def start(self):
         log.info("Starting P2P Node...")
@@ -90,14 +86,14 @@ class P2PNode:
 
         log.success("Node stopped")
 
-    # ── Handler registration ──────────────────────────────────────────────────
+    # Handler registration 
 
     def _register_handlers(self):
         self.server.register_handler("LIST_FILES",    self.file_service.handle_list_files)
         self.server.register_handler("REQUEST_FILE",  self.file_service.handle_file_request)
         log.info("Handlers registered: LIST_FILES, REQUEST_FILE")
 
-    # ── Peer / file refresh ───────────────────────────────────────────────────
+    # Peer / file refresh
 
     def refresh_peers(self) -> list[dict]:
         """Public method: re-fetch peer list from tracker and rebuild file cache."""
@@ -108,7 +104,6 @@ class P2PNode:
         return peers
 
     def _auto_refresh_loop(self):
-        """Background thread: periodically refresh peers and remote file cache."""
         while self.running:
             time.sleep(AUTO_REFRESH_INTERVAL)
             if not self.running:
@@ -121,13 +116,6 @@ class P2PNode:
                 log.warn(f"Auto-refresh error: {e}")
 
     def _refresh_remote_files(self):
-        """
-        Contact every known peer and cache their shared file list.
-
-        Runs on startup and after every manual/auto peer refresh.
-        Each peer is contacted concurrently via threads to keep startup fast
-        even when several peers are on the network.
-        """
         peers = self.discovery_service.get_peers_safe()
 
         if not peers:
@@ -177,7 +165,7 @@ class P2PNode:
         except Exception as e:
             log.warn(f"Failed to list files from peer [{idx}] {peer_id}: {e}")
 
-    # ── Display helpers (used by CLI) ─────────────────────────────────────────
+    # Display helpers (used by CLI)
 
     def get_peers_display(self) -> list[dict]:
         """Return the current peer list with stable indices for the CLI."""
@@ -207,17 +195,15 @@ class P2PNode:
                     })
         return result
 
-    # ── Download ──────────────────────────────────────────────────────────────
+    # Download 
 
     def get_peer_for_download(self, peer_index: int) -> dict | None:
-        """Resolve a peer index (from 'peers' / 'remote' commands) to host+port."""
         peers = self.get_peers_display()
         if 0 <= peer_index < len(peers):
             return peers[peer_index]
         return None
 
     def download(self, peer_index: int, filename: str):
-        """Download a file from the peer at the given index."""
         peer = self.get_peer_for_download(peer_index)
         if not peer:
             log.error(

@@ -39,9 +39,6 @@ def run_cli(node: P2PNode):
 
     while True:
         try:
-            # ── Drain pending approval requests BEFORE blocking on input ──────
-            # The background server thread enqueues incoming requests here.
-            # We drain all of them so the user sees prompts immediately.
             try:
                 while True:
                     request = node.file_service.approval_queue.get_nowait()
@@ -77,7 +74,7 @@ def run_cli(node: P2PNode):
             if not cmd:
                 continue
 
-            # ── list: show LOCAL shared files ─────────────────────────────────
+            # list: show LOCAL shared files
             if cmd == "list":
                 files = node.file_service.get_files()
                 if not files:
@@ -89,7 +86,7 @@ def run_cli(node: P2PNode):
                         print(f"  {f['filename']:<40} {f['size']:>10} B")
                     print()
 
-            # ── remote: show files from ALL peers ────────────────────────────
+            # remote: show files from ALL peers 
             elif cmd == "remote":
                 remote_files = node.get_remote_files_display()
                 if not remote_files:
@@ -105,7 +102,7 @@ def run_cli(node: P2PNode):
                         )
                     print(f"\n  Use: download <peer_index> <filename>\n")
 
-            # ── peers: show known peers with index ───────────────────────────
+            # peers: show known peers with index
             elif cmd == "peers":
                 peers = node.get_peers_display()
                 if not peers:
@@ -117,13 +114,13 @@ def run_cli(node: P2PNode):
                         print(f"  [{p['index']:>3}]  {p['host']:<20} {p['port']:>6}")
                     print()
 
-            # ── refresh: re-fetch peers + remote file cache ──────────────────
+            # refresh: re-fetch peers + remote file cache
             elif cmd == "refresh":
                 print("  Refreshing peer list and remote file cache...")
                 peers = node.refresh_peers()
                 print(f"  Found {len(peers)} peer(s).")
 
-            # ── download: fetch a file from a specific peer ──────────────────
+            # download: fetch a file from a specific peer
             elif cmd.startswith("download"):
                 parts = cmd.split()
                 if len(parts) != 3:
@@ -140,11 +137,11 @@ def run_cli(node: P2PNode):
 
                 node.download(peer_index, filename)
 
-            # ── help ──────────────────────────────────────────────────────────
+            # help 
             elif cmd in ("help", "?"):
                 print_help()
 
-            # ── exit ──────────────────────────────────────────────────────────
+            # exit 
             elif cmd in ("exit", "quit"):
                 break
 

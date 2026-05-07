@@ -22,14 +22,12 @@ log = get_logger("FileService")
 # 5 minutes should be more than enough for a human to respond.
 APPROVAL_TIMEOUT = 300.0
 
-
 def format_bytes(n: int) -> str:
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024:
             return f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} TB"
-
 
 class FileService:
 
@@ -41,10 +39,9 @@ class FileService:
         # The background server thread puts items in; the CLI thread reads them.
         self.approval_queue: queue.Queue = queue.Queue()
 
-    # ── Local helpers ─────────────────────────────────────────────────────────
+    # Local helpers
 
     def get_files(self) -> list[dict]:
-        """Return metadata for every file in the local shared directory."""
         files = []
         for path in SHARED_DIR.iterdir():
             if path.is_file():
@@ -55,7 +52,6 @@ class FileService:
         return files
 
     def _safe_path(self, filename: str) -> Path:
-        """Resolve filename inside SHARED_DIR, blocking directory traversal."""
         resolved = (SHARED_DIR / filename).resolve()
         if not str(resolved).startswith(str(SHARED_DIR.resolve())):
             raise ValueError(f"Path traversal attempt blocked: {filename!r}")
@@ -69,15 +65,9 @@ class FileService:
                 h.update(chunk)
         return h.hexdigest()
 
-    # ── Client-side: list files on a remote peer ──────────────────────────────
+    # Client-side: list files on a remote peer 
 
     def list_remote_files(self, host: str, port: int) -> list[dict]:
-        """
-        Connect to a peer, send LIST_FILES, and return its file list.
-
-        Returns an empty list on any error so the caller can continue with
-        the remaining peers without crashing.
-        """
         client = PeerClient(host, port, timeout=10)
         try:
             client.connect()
@@ -102,7 +92,7 @@ class FileService:
         finally:
             client.close()
 
-    # ── Server-side: respond to LIST_FILES ────────────────────────────────────
+    # Server-side: respond to LIST_FILES 
 
     def handle_list_files(self, conn, message: dict):
         """Send our local file list to the requesting peer."""
@@ -114,7 +104,7 @@ class FileService:
         except Exception as e:
             log.error(f"Failed to send file list to {requester}: {e}")
 
-    # ── Server-side: respond to REQUEST_FILE ──────────────────────────────────
+    # Server-side: respond to REQUEST_FILE
 
     def handle_file_request(self, conn, message: dict):
         """Handle an incoming file request: check availability, ask user, transfer."""
@@ -128,14 +118,14 @@ class FileService:
 
         log.info(f"File request from {requester}: {filename!r}")
 
-        # ── 1. File must be in the shared folder ──────────────────────────────
+        # 1. File must be in the shared folder
         available = [f["filename"] for f in self.get_files()]
         if filename not in available:
             log.warn(f"Not shared — rejecting request for {filename!r} from {requester}")
             send_message(conn, make_rejected(filename, "File not shared"))
             return
 
-        # ── 2. Resolve path safely ────────────────────────────────────────────
+        # 2. Resolve path safely 
         try:
             file_path = self._safe_path(filename)
         except ValueError as e:
@@ -143,13 +133,13 @@ class FileService:
             send_message(conn, make_rejected(filename, "Invalid file path"))
             return
 
-        # ── 3. File must still exist on disk ──────────────────────────────────
+        # 3. File must still exist on disk 
         if not file_path.exists():
             log.warn(f"File missing on disk: {file_path}")
             send_message(conn, make_rejected(filename, "File not found on disk"))
             return
 
-        # ── 4. Ask the CLI user for approval ──────────────────────────────────
+        # 4. Ask the CLI user for approval
         result_event = threading.Event()
         result_box   = [None]
 
@@ -180,7 +170,7 @@ class FileService:
             send_message(conn, make_rejected(filename, "Approval timed out"))
             return
 
-        # ── 5. Send or reject based on user decision ──────────────────────────
+        # 5. Send or reject based on user decision 
         if result_box[0] == "approved":
             log.info(f"Approved — sending {filename!r} to {requester}")
             checksum  = self._compute_checksum(file_path)
@@ -191,10 +181,9 @@ class FileService:
             log.info(f"Rejected by user — {filename!r} will not be sent to {requester}")
             send_message(conn, make_rejected(filename, "Rejected by user"))
 
-    # ── File streaming ────────────────────────────────────────────────────────
+    # File streaming 
 
     def _send_file(self, conn, file_path: Path):
-        """Send file to peer in CHUNK_SIZE chunks."""
         file_size = file_path.stat().st_size
         log.info(f"Starting transfer: {file_path.name} ({format_bytes(file_size)})")
 

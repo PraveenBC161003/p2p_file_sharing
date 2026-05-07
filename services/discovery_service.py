@@ -13,14 +13,6 @@ HEARTBEAT_INTERVAL = 30.0
 
 
 def get_lan_ip() -> str:
-    """
-    Determine the machine's LAN IP address by opening a UDP socket toward
-    the tracker and reading the local interface that the OS selects.
-
-    This does NOT send any packets — connect() on UDP just sets the routing
-    information without a handshake.  Falls back to "127.0.0.1" if the
-    machine has no default route (e.g. offline).
-    """
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(2)
@@ -51,10 +43,9 @@ class DiscoveryService:
         self._heartbeat_thread: threading.Thread | None = None
         self._running = False
 
-    # ── Registration ──────────────────────────────────────────────────────────
+    # Registration 
 
     def register(self):
-        """Register this node with the tracker and start the heartbeat loop."""
         self._send_register()
 
         # Start background heartbeat so the tracker never expires us
@@ -67,7 +58,6 @@ class DiscoveryService:
         self._heartbeat_thread.start()
 
     def _send_register(self):
-        """Send a single REGISTER message to the tracker."""
         client = PeerClient(self.tracker_host, self.tracker_port, timeout=10)
         try:
             client.connect()
@@ -83,10 +73,9 @@ class DiscoveryService:
         finally:
             client.close()
 
-    # ── Heartbeat ─────────────────────────────────────────────────────────────
+    # Heartbeat 
 
     def _heartbeat_loop(self):
-        """Periodically send HEARTBEAT so the tracker doesn't expire us."""
         while self._running:
             time.sleep(HEARTBEAT_INTERVAL)
             if not self._running:
@@ -110,13 +99,9 @@ class DiscoveryService:
                 except Exception:
                     pass
 
-    # ── Peer discovery ────────────────────────────────────────────────────────
+    # Peer discovery 
 
     def refresh_peers(self) -> list[dict]:
-        """
-        Fetch the latest peer list from the tracker, filter out this node,
-        and update the local cache.
-        """
         client = PeerClient(self.tracker_host, self.tracker_port, timeout=10)
         try:
             client.connect()
@@ -127,12 +112,6 @@ class DiscoveryService:
                 return self.peers
 
             all_peers: list[dict] = response.get("peers", [])
-
-            # ── KEY FIX: remove self from peer list ──────────────────────────
-            # The tracker includes us in its list. Without this filter, we
-            # would try to download files from ourselves, which succeeds
-            # locally (same machine) but makes no sense in real use, and
-            # can cause phantom "peers" in the CLI output.
             filtered = [
                 p for p in all_peers
                 if not (p.get("host") == self.local_ip and p.get("port") == self.port)
@@ -156,10 +135,9 @@ class DiscoveryService:
 
         return self.get_peers_safe()
 
-    # ── Deregistration ────────────────────────────────────────────────────────
+    #  Deregistration
 
     def deregister(self):
-        """Stop heartbeat and remove this node from the tracker."""
         self._running = False
 
         client = PeerClient(self.tracker_host, self.tracker_port, timeout=10)
@@ -172,9 +150,8 @@ class DiscoveryService:
         finally:
             client.close()
 
-    # ── Thread-safe access ────────────────────────────────────────────────────
+    #Thread-safe access 
 
     def get_peers_safe(self) -> list[dict]:
-        """Return a thread-safe snapshot of the current peer list."""
         with self._peers_lock:
             return self.peers.copy()
