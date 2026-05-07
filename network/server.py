@@ -57,9 +57,19 @@ class PeerServer:
                 log.error(f"Accept error: {e}")
 
     def _handle_client(self, conn: socket.socket, addr):
+        """Handle incoming client connection."""
+        conn.settimeout(30.0)  # Individual client socket timeout
+        
         try:
             while self.running:
-                message = recv_message(conn)
+                try:
+                    message = recv_message(conn)
+                except socket.timeout:
+                    log.debug(f"Receive timeout from {addr}")
+                    break
+                except Exception as e:
+                    log.warning(f"Failed to receive from {addr}: {e}")
+                    break
 
                 if not isinstance(message, dict):
                     log.warning(f"Invalid message format from {addr}")
@@ -85,13 +95,14 @@ class PeerServer:
                     log.warning(f"No handler for message type: {msg_type}")
 
         except Exception as e:
-            log.warning(f"Connection closed: {addr} ({e})")
+            log.warning(f"Client handler error from {addr}: {e}")
 
         finally:
             try:
                 conn.close()
             except Exception:
                 pass
+            log.debug(f"Connection closed: {addr}")
 
     def stop(self):
         self.running = False

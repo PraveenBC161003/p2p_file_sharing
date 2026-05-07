@@ -8,60 +8,83 @@ log = get_logger("Client")
 
 
 class PeerClient:
-    def __init__(self, host: str, port: int = 5000, timeout: float = 10): # self represents the current object, others are the inputs I pass
-        self.host = host # Store this value inside this object
+    def __init__(self, host: str, port: int = 5000, timeout: float = 30):
+        """Initialize a peer client.
+        
+        Args:
+            host: Target peer hostname/IP
+            port: Target peer port
+            timeout: Socket timeout in seconds (default 30s)
+        """
+        self.host = host
         self.port = port
         self.timeout = timeout
 
-        self.sock: Optional[socket.socket] = None # NO connection yet. Will be set later in connect()
-        self.connected = False # Not connected yet
-        # Without self, values don’t belong to the object. This is crucial for managing multiple connections and keeping state.
+        self.sock: Optional[socket.socket] = None
+        self.connected = False
 
     def connect(self):
+        """Connect to the peer with proper error handling."""
         if self.connected:
             log.warn("Already connected")
-            return # If a connection is already open, Don't create another one. Prevents resource leaks and inconsistent state.
+            return
 
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(self.timeout) # TCP Communication channel
+            self.sock.settimeout(self.timeout)
 
-            log.info(f"Connecting to {self.host}:{self.port}...")
-            self.sock.connect((self.host, self.port)) # Performs the TCP handshake with remote peer. In success you now have a live connection
-            # Limits how long operations can block, Avoids hanging forever if peer is unresponsive.
+            log.debug(f"Connecting to {self.host}:{self.port} (timeout={self.timeout}s)...")
+            self.sock.connect((self.host, self.port))
 
-            self.connected = True # Internal flag so other methods know the socket is ready
-            log.success("Connected") # Confirms connection is established
+            self.connected = True
+            log.debug(f"Connected to {self.host}:{self.port}")
 
-        except Exception as e:
-            raise ConnectionError(f"Failed to connect: {e}") # Catches any failure (DNS issues, refused connection, timeout, etc.). Re-raises a clean, domain-level error
+        except socket.timeout:
+            raise ConnectionError(f"Connection timeout to {self.host}:{self.port}")
+        except ConnectionRefusedError:
+            raise ConnectionError(f"Connection refused by {self.host}:{self.port}")
+        except OSError as e:
+            raise ConnectionError(f"Failed to connect to {self.host}:{self.port}: {e}")
 
 
     def send(self, message: dict):
-        self._ensure_connected() # Prevents illegal usage like sending before connect()
-
-        try:
-            send_message(self.sock, message) # Calls protocol.py {dict -> JSON -> bytes -> send over socket}. This keeps the network logic separate from business logic
-        except Exception as e:
-            self.connected = False # Prevents future operations from assuming the connection still works
-            raise ConnectionError(f"Send failed: {e}") # Wraps low-level error into a clear, domain-level exception, Makes upstream code easier to handle
-
-
-    def receive(self) -> dict:
+        """Send a message to the peer."""
         self._ensure_connected()
 
         try:
-            return recv_message(self.sock) # Calls protocol.py {recv bytes -> JSON -> dict}. This keeps the network logic separate from business logic
+            send_message(self.sock, message)
+            log.debug(f"Sent: {message.get('type', '?')}")
+        except socket.timeout:
+            self.connected = False
+            raise ConnectionError(f"Send timeout to {self.host}:{self.port}")
+        except Exception as e:
+            self.connected = False
+            raise ConnectionError(f"Send failed: {e}")
+
+
+    def receive(self) -> dict:
+        """Receive a message from the peer."""
+        self._ensure_connected()
+
+        try:
+            message = recv_message(self.sock)
+            log.debug(f"Received: {message.get('type', '?')}")
+            return message
+        except socket.timeout:
+            self.connected = False
+            raise ConnectionError(f"Receive timeout from {self.host}:{self.port}")
         except Exception as e:
             self.connected = False
             raise ConnectionError(f"Receive failed: {e}")
 
 
     def send_and_receive(self, message: dict) -> dict:
-        self.send(message) # First send the message, Then wait for a response. This is a common pattern for request-response interactions
+        """Send a message and wait for a response."""
+        self.send(message)
         return self.receive()
     
     def close(self):
+        """Close the connection."""
         if self.sock:
             try:
                 self.sock.close()
@@ -69,8 +92,9 @@ class PeerClient:
                 pass
 
         self.connected = False
-        log.info("Connection closed")
+        log.debug("Connection closed")
 
     def _ensure_connected(self):
+        """Verify that connection is established."""
         if not self.connected or not self.sock:
-            raise RuntimeError("Not connected to peer")
+            raise RuntimeError(f"Not connected to {self.host}:{self.port}")

@@ -1,3 +1,4 @@
+import threading
 from utils.logger import get_logger
 from network.client import PeerClient
 
@@ -9,10 +10,12 @@ class DiscoveryService:
         self.tracker_host = tracker_host
         self.tracker_port = tracker_port
 
-        self.peers = []
+        self.peers = []  # List of peer info dicts: {"host": "...", "port": ...}
+        self._peers_lock = threading.Lock()  # Ensure thread-safe access
 
     def register(self):
-        client = PeerClient(self.tracker_host, self.tracker_port)
+        """Register this node with the tracker."""
+        client = PeerClient(self.tracker_host, self.tracker_port, timeout=10)
 
         try:
             client.connect()
@@ -36,7 +39,8 @@ class DiscoveryService:
             client.close()
 
     def refresh_peers(self):
-        client = PeerClient(self.tracker_host, self.tracker_port)
+        """Fetch latest peer list from tracker and update local cache."""
+        client = PeerClient(self.tracker_host, self.tracker_port, timeout=10)
 
         try:
             client.connect()
@@ -48,7 +52,12 @@ class DiscoveryService:
             response = client.send_and_receive(message)
 
             if response.get("type") == "PEER_LIST":
-                self.peers = response.get("peers", [])
+                peer_list = response.get("peers", [])
+                
+                # Thread-safe update
+                with self._peers_lock:
+                    self.peers = peer_list
+                
                 log.info(f"Peers updated: {len(self.peers)} found")
 
             else:
@@ -63,7 +72,8 @@ class DiscoveryService:
         return self.peers
 
     def deregister(self):
-        client = PeerClient(self.tracker_host, self.tracker_port)
+        """Deregister this node from the tracker."""
+        client = PeerClient(self.tracker_host, self.tracker_port, timeout=10)
 
         try:
             client.connect()
@@ -81,3 +91,8 @@ class DiscoveryService:
 
         finally:
             client.close()
+
+    def get_peers_safe(self):
+        """Get a thread-safe copy of the peer list."""
+        with self._peers_lock:
+            return self.peers.copy()

@@ -15,6 +15,7 @@ class Tracker:
         self.peers = set()  # {(ip, port)}
         self.running = False
         self.server_socket = None
+        self._peers_lock = threading.Lock()
 
     def start(self):
         self.running = True
@@ -37,9 +38,11 @@ class Tracker:
                 ).start()
 
             except Exception as e:
-                log.error(f"Accept error: {e}")
+                if self.running:
+                    log.error(f"Accept error: {e}")
 
     def _handle_client(self, conn, addr):
+        """Handle tracker client requests."""
         ip = addr[0]
 
         try:
@@ -51,20 +54,24 @@ class Tracker:
                 port = message.get("port")
 
                 if port:
-                    self.peers.add((ip, port))
-                    log.info(f"Registered: {ip}:{port}")
-
+                    with self._peers_lock:
+                        self.peers.add((ip, port))
+                    
+                    log.info(f"✓ Registered: {ip}:{port} (total peers: {len(self.peers)})")
                     send_message(conn, {"type": "ACK"})
                 else:
+                    log.warning(f"Register failed - missing port from {ip}")
                     send_message(conn, {"type": "ERROR", "reason": "Missing port"})
 
             # ───────── GET PEERS ─────────
             elif msg_type == "GET_PEERS":
-                peer_list = [
-                    {"host": p[0], "port": p[1]}
-                    for p in self.peers
-                ]
+                with self._peers_lock:
+                    peer_list = [
+                        {"host": p[0], "port": p[1]}
+                        for p in self.peers
+                    ]
 
+                log.debug(f"Peer list requested from {ip}: returning {len(peer_list)} peers")
                 send_message(conn, {
                     "type": "PEER_LIST",
                     "peers": peer_list
@@ -74,25 +81,39 @@ class Tracker:
             elif msg_type == "DEREGISTER":
                 port = message.get("port")
 
-                if (ip, port) in self.peers:
-                    self.peers.remove((ip, port))
-                    log.info(f"Deregistered: {ip}:{port}")
+                with self._peers_lock:
+                    if (ip, port) in self.peers:
+                        self.peers.remove((ip, port))
+                        log.info(f"✓ Deregistered: {ip}:{port} (total peers: {len(self.peers)})")
+                    else:
+                        log.warning(f"Deregister failed - peer not found: {ip}:{port}")
 
                 send_message(conn, {"type": "ACK"})
 
             else:
+                log.warning(f"Unknown message type from {ip}: {msg_type}")
                 send_message(conn, {"type": "ERROR", "reason": "Unknown type"})
 
         except Exception as e:
             log.warn(f"Client error {addr}: {e}")
 
         finally:
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def stop(self):
         self.running = False
         if self.server_socket:
-            self.server_socket.close()
+            try:
+                self.server_socket.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                self.server_socket.close()
+            except Exception:
+                pass
         log.info("Tracker stopped")
 
 
