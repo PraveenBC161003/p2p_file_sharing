@@ -155,7 +155,7 @@ class P2PNode:
                     }
                 log.debug(f"Cached {len(files)} file(s) from {peer_id}")
             except Exception as e:
-                log.warning(f"Failed to list files from {peer_id}: {e}")
+                log.warn(f"Failed to list files from {peer_id}: {e}")
     
     def get_remote_files_display(self) -> list:
         """Return all remote files formatted for CLI display."""

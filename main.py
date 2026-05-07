@@ -77,11 +77,14 @@ def run_cli(node: P2PNode):
 
             elif cmd.startswith("download"):
                 parts = cmd.split()
-                if len(parts) != 4:
-                    print("Usage: download <host> <port> <filename>")
+                if len(parts) != 3:
+                    print("Usage: download <peer_index> <filename>")
                     continue
-                _, host, port, filename = parts
-                node.download(host, int(port), filename)
+                _, peer_index, filename = parts
+                try:
+                    node.download(int(peer_index), filename)
+                except ValueError:
+                    print("Peer index must be a number")
 
             elif cmd == "peers":
                 peers = node.discovery_service.peers
