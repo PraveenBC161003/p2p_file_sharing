@@ -1,4 +1,6 @@
 import threading
+import time
+
 from utils.logger import get_logger
 
 from network.server import PeerServer
@@ -8,186 +10,223 @@ from services.discovery_service import DiscoveryService
 
 log = get_logger("Node")
 
-# use a class (P2PNode) to group all components (server, services, config) into one controllable object that represents a single running node. 
-# This makes it easier to manage state, start/stop the system, and pass around dependencies.
-class P2PNode:
-    
-    # __init__ => Bootstrap layer. It guarantees that every instance of your class starts in a fully configured, ready-to-run state.
-    def __init__(self, port: int, tracker_host: str, tracker_port: int):
-        # self -> The current object
-        # port -> The port number this node will listen on (for incoming peer connections)
-        # tracker_host -> The hostname/IP of the tracker server (for peer discovery)
-        # tracker_port -> The port number of the tracker server
- 
-        self.port = port # node identity in the network
+# How often to automatically refresh the peer list and remote file cache (seconds).
+# Keeps the node up-to-date as new peers join/leave the network.
+AUTO_REFRESH_INTERVAL = 60.0
 
-        # Core components
-        self.server = PeerServer(port=port) # Listens to other peers, Accepts Connects, receives file requests
-        self.file_service = FileService() # List available files, Read files, Provide metadata -> data layer
-        self.download_service = DownloadService() # Request files from peers, Receive file chunks, Reassemble files -> Client side transfer engine
+
+class P2PNode:
+
+    def __init__(self, port: int, tracker_host: str, tracker_port: int):
+        self.port = port
+
+        # ── Core components ───────────────────────────────────────────────────
+        self.server = PeerServer(port=port)
+        self.file_service = FileService()
+        self.download_service = DownloadService()
         self.discovery_service = DiscoveryService(
             port=port,
             tracker_host=tracker_host,
-            tracker_port=tracker_port
-        ) # Register this peer with tracker, Discover other peers, Maintain peer list -> P2P network graph
-
-        self.running = False # Indicates whether the node is active, Used to control lifecycle and prevent actions when stopped
-        
-        # Thread-safe access to peer list and remote files
-        self._peers_lock = threading.Lock()
-        self._remote_files_cache = {}  # {peer_id: [files]}
-        self._remote_files_lock = threading.Lock()
-
-
-    def start(self): # This function is a runtime orchestrator - This transitions the node from configured to actively participating in the P2P network.
-        log.info("Starting P2P Node...") # Signals system boot, Useful for debugging lifecycle issues -> Observability hook
-
-        # Step 1: Register handlers BEFORE starting server
-        self._register_handlers()
-
-        # Step 2: Start server
-        self.server.start() # Opens socket, Begins listening on self.port, Accepts incoming peer connections. At this point the nodes becomes visible and reachable to other peers
-
-        # Step 3: Register with tracker
-        self.discovery_service.register() # Sends node info to tracker, IP address, Port, Availability -> This makes node discoverable
-
-        # Step 4: Fetch peer list
-        peers = self.discovery_service.refresh_peers() # Requests updated peer list from tracker, This enables Outgoing connections and File requests
-
-        log.info(f"Connected peers available: {len(peers)}") # Gives immediate visibility into network state, Useful for debugging connectivity and discovery issues
-
-        self.running = True # Marks node as Active
-        log.success("Node started successfully") # Final confirmation
-        
-        # Fetch remote files from all peers
-        self._refresh_remote_files()
-
-
-    def stop(self):
-
-        log.info("Stopping node...") # This is a logging call, not just output Can include metadata like: Time, Module name, Thread
-
-        # print() => Stopping node.. => basic output
-        # log.info() => [2024-06-01 12:00:00] [Node] Stopping node... => production-grade observability tool
+            tracker_port=tracker_port,
+        )
 
         self.running = False
 
-        # Deregister from tracker
-        self.discovery_service.deregister()
+        # ── Remote file cache ─────────────────────────────────────────────────
+        # Structure: { "host:port" -> { "peer_index": int, "host": str,
+        #                               "port": int, "files": [...] } }
+        self._remote_files_cache: dict[str, dict] = {}
+        self._remote_files_lock = threading.Lock()
 
-        # Stop server
+        # Background refresh thread
+        self._refresh_thread: threading.Thread | None = None
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def start(self):
+        log.info("Starting P2P Node...")
+
+        # 1. Register handlers before the server accepts connections
+        self._register_handlers()
+
+        # 2. Start listening for inbound peer connections
+        self.server.start()
+
+        # 3. Register with tracker (also starts the heartbeat loop)
+        self.discovery_service.register()
+
+        # 4. Fetch initial peer list
+        # Give the server a moment to finish binding so that if we are
+        # the first peer and another node is already running, they can
+        # immediately connect back to us.
+        time.sleep(0.5)
+        peers = self.discovery_service.refresh_peers()
+        log.info(f"Initial peer count: {len(peers)}")
+
+        self.running = True
+
+        # 5. Populate remote file cache from all known peers
+        self._refresh_remote_files()
+
+        # 6. Start background auto-refresh so the node stays current as
+        #    more peers join the network over time.
+        self._refresh_thread = threading.Thread(
+            target=self._auto_refresh_loop,
+            daemon=True,
+            name="NodeAutoRefresh"
+        )
+        self._refresh_thread.start()
+
+        log.success("Node started successfully")
+        log.info(f"Listening on 0.0.0.0:{self.port}")
+        log.info(f"LAN IP: {self.discovery_service.local_ip}")
+
+    def stop(self):
+        log.info("Stopping node...")
+        self.running = False
+
+        self.discovery_service.deregister()
         self.server.stop()
 
         log.success("Node stopped")
 
-    def _register_handlers(self): # It creates mapping between message types and functions
+    # ── Handler registration ──────────────────────────────────────────────────
 
-        self.server.register_handler(
-            "LIST_FILES", # file listing logic
-            self.file_service.handle_list_files 
-        )
-        # Request Arrives -> "LIST_FILES"
-        # Server finds handler
-        # calls handle_list_files()
-        # Returns list of files -> This enables file discovery across peers
+    def _register_handlers(self):
+        self.server.register_handler("LIST_FILES",    self.file_service.handle_list_files)
+        self.server.register_handler("REQUEST_FILE",  self.file_service.handle_file_request)
+        log.info("Handlers registered: LIST_FILES, REQUEST_FILE")
 
-        # URL -> Controller
-        # Message Type -> Handler Function
+    # ── Peer / file refresh ───────────────────────────────────────────────────
 
-        self.server.register_handler(
-            "REQUEST_FILE", # file sending logic
-            self.file_service.handle_file_request
-        )
-
-        # Request Arrives -> "REQUEST_FILE"
-        # Server finds handler
-        # calls handle_file_request()
-        # Reads files + sends chunks -> This powers actual file transfer
-
-        log.info("Handlers registered")
-    
-    def refresh_peers(self):
-        """Fetch latest peer list from tracker and refresh remote files."""
+    def refresh_peers(self) -> list[dict]:
+        """Public method: re-fetch peer list from tracker and rebuild file cache."""
         log.info("Refreshing peer list...")
         peers = self.discovery_service.refresh_peers()
         log.info(f"Found {len(peers)} peer(s)")
         self._refresh_remote_files()
         return peers
-    
-    def get_peers_display(self) -> list:
-        """Return list of peers with formatted info for CLI display."""
-        with self._peers_lock:
-            peers = self.discovery_service.peers
-            result = []
-            for idx, peer in enumerate(peers):
-                host = peer.get("host", "unknown")
-                port = peer.get("port", 0)
-                peer_id = f"{host}:{port}"
-                result.append({
-                    "index": idx,
-                    "host": host,
-                    "port": port,
-                    "id": peer_id
-                })
-            return result
-    
+
+    def _auto_refresh_loop(self):
+        """Background thread: periodically refresh peers and remote file cache."""
+        while self.running:
+            time.sleep(AUTO_REFRESH_INTERVAL)
+            if not self.running:
+                break
+            try:
+                log.debug("Auto-refresh: updating peer list and remote file cache...")
+                self.discovery_service.refresh_peers()
+                self._refresh_remote_files()
+            except Exception as e:
+                log.warn(f"Auto-refresh error: {e}")
+
     def _refresh_remote_files(self):
-        """Fetch file list from all discovered peers and cache them."""
-        with self._peers_lock:
-            peers = self.discovery_service.peers.copy()
-        
+        """
+        Contact every known peer and cache their shared file list.
+
+        Runs on startup and after every manual/auto peer refresh.
+        Each peer is contacted concurrently via threads to keep startup fast
+        even when several peers are on the network.
+        """
+        peers = self.discovery_service.get_peers_safe()
+
+        if not peers:
+            log.debug("No remote peers to list files from")
+            return
+
+        log.info(f"Fetching remote file lists from {len(peers)} peer(s)...")
+
+        # Reset cache before re-populating
         with self._remote_files_lock:
             self._remote_files_cache.clear()
-        
+
+        threads = []
         for idx, peer in enumerate(peers):
-            host = peer.get("host")
-            port = peer.get("port")
-            peer_id = f"{host}:{port}"
-            
-            try:
-                files = self.file_service.list_remote_files(host, port)
-                with self._remote_files_lock:
-                    self._remote_files_cache[peer_id] = {
-                        "peer_index": idx,
-                        "host": host,
-                        "port": port,
-                        "files": files
-                    }
-                log.debug(f"Cached {len(files)} file(s) from {peer_id}")
-            except Exception as e:
-                log.warn(f"Failed to list files from {peer_id}: {e}")
-    
-    def get_remote_files_display(self) -> list:
-        """Return all remote files formatted for CLI display."""
+            t = threading.Thread(
+                target=self._fetch_peer_files,
+                args=(idx, peer),
+                daemon=True
+            )
+            threads.append(t)
+            t.start()
+
+        # Wait for all concurrent fetches (with a reasonable wall-clock limit)
+        for t in threads:
+            t.join(timeout=15)
+
+        with self._remote_files_lock:
+            total = sum(len(d["files"]) for d in self._remote_files_cache.values())
+        log.info(f"Remote file cache ready: {total} file(s) across {len(peers)} peer(s)")
+
+    def _fetch_peer_files(self, idx: int, peer: dict):
+        """Fetch and cache the file list from a single peer (runs in a thread)."""
+        host = peer.get("host")
+        port = peer.get("port")
+        peer_id = f"{host}:{port}"
+
+        try:
+            files = self.file_service.list_remote_files(host, port)
+            with self._remote_files_lock:
+                self._remote_files_cache[peer_id] = {
+                    "peer_index": idx,
+                    "host": host,
+                    "port": port,
+                    "files": files,
+                }
+            log.debug(f"Cached {len(files)} file(s) from peer [{idx}] {peer_id}")
+        except Exception as e:
+            log.warn(f"Failed to list files from peer [{idx}] {peer_id}: {e}")
+
+    # ── Display helpers (used by CLI) ─────────────────────────────────────────
+
+    def get_peers_display(self) -> list[dict]:
+        """Return the current peer list with stable indices for the CLI."""
+        peers = self.discovery_service.get_peers_safe()
+        return [
+            {
+                "index": idx,
+                "host":  p.get("host", "unknown"),
+                "port":  p.get("port", 0),
+                "id":    f"{p.get('host')}:{p.get('port')}",
+            }
+            for idx, p in enumerate(peers)
+        ]
+
+    def get_remote_files_display(self) -> list[dict]:
+        """Return all cached remote files formatted for CLI display."""
         result = []
         with self._remote_files_lock:
             for peer_id, data in self._remote_files_cache.items():
                 for file_info in data.get("files", []):
                     result.append({
-                        "filename": file_info.get("filename", "unknown"),
-                        "size": file_info.get("size", 0),
+                        "filename":  file_info.get("filename", "unknown"),
+                        "size":      file_info.get("size", 0),
                         "from_peer": data.get("peer_index"),
-                        "host": data.get("host"),
-                        "port": data.get("port")
+                        "host":      data.get("host"),
+                        "port":      data.get("port"),
                     })
         return result
-    
-    def get_peer_for_download(self, peer_index: int) -> dict:
-        """Get peer info by index for download operation."""
+
+    # ── Download ──────────────────────────────────────────────────────────────
+
+    def get_peer_for_download(self, peer_index: int) -> dict | None:
+        """Resolve a peer index (from 'peers' / 'remote' commands) to host+port."""
         peers = self.get_peers_display()
         if 0 <= peer_index < len(peers):
             return peers[peer_index]
         return None
 
     def download(self, peer_index: int, filename: str):
-        """Download file from a peer using peer index."""
+        """Download a file from the peer at the given index."""
         peer = self.get_peer_for_download(peer_index)
         if not peer:
-            log.error(f"Invalid peer index: {peer_index}")
+            log.error(
+                f"Invalid peer index: {peer_index}. "
+                f"Run 'peers' to see valid indices (0 – {len(self.get_peers_display()) - 1})."
+            )
             return
-        
-        host = peer.get("host")
-        port = peer.get("port")
-        
-        log.info(f"Downloading '{filename}' from peer {peer_index} ({host}:{port})")
+
+        host = peer["host"]
+        port = peer["port"]
+        log.info(f"Downloading '{filename}' from peer [{peer_index}] ({host}:{port})")
         self.download_service.download_file(host, port, filename)

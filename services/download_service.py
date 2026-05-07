@@ -1,6 +1,5 @@
 import hashlib
 import base64
-import socket
 from pathlib import Path
 
 from utils.logger import get_logger
@@ -12,75 +11,101 @@ from network.protocol import make_request_file
 log = get_logger("DownloadService")
 
 
+def format_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
 class DownloadService:
+
     def __init__(self):
-        DOWNLOADS_DIR.mkdir(exist_ok=True)
+        DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
     def download_file(self, host: str, port: int, filename: str):
-        """Download file from peer with proper error handling and timeouts."""
+        """Download a file from a remote peer with full error handling."""
         client = PeerClient(host, port, timeout=TRANSFER_TIMEOUT)
 
         try:
-            log.info(f"Connecting to {host}:{port} to download {filename}")
+            log.info(f"Connecting to {host}:{port} to download {filename!r}")
             client.connect()
 
-            # Step 1: Send download request to peer
-            log.debug("Sending file request...")
+            # ── Step 1: Send download request ────────────────────────────────
+            log.debug("Sending REQUEST_FILE...")
             client.send(make_request_file(filename))
 
-            # Step 2: Wait for approval or rejection
-            log.debug("Waiting for peer approval...")
+            # ── Step 2: Wait for approval or rejection ────────────────────────
+            # The remote peer's CLI user may take time to approve — use the
+            # full TRANSFER_TIMEOUT here so we don't bail out prematurely.
+            log.debug("Waiting for peer to approve/reject...")
             response = client.receive()
 
-            if response["type"] == "REJECTED":
-                # Peer explicitly refused — log the reason and stop
+            if response.get("type") == "REJECTED":
                 reason = response.get("reason", "unknown")
-                log.warning(f"Download rejected by peer: {reason}")
+                log.warn(f"Download rejected by {host}:{port}: {reason}")
                 return
 
-            if response["type"] != "APPROVED":
-                # Received something unexpected instead of APPROVED/REJECTED — abort
-                log.error(f"Unexpected response type: {response.get('type')}")
+            if response.get("type") != "APPROVED":
+                log.error(
+                    f"Expected APPROVED/REJECTED from {host}:{port}, "
+                    f"got: {response.get('type')!r}"
+                )
                 return
 
-            # Extract metadata from approval message
+            # ── Step 3: Parse approval metadata ──────────────────────────────
             expected_size     = response.get("size")
             expected_checksum = response.get("checksum")
 
             if not expected_checksum:
-                # Sender did not provide a checksum — cannot verify integrity after download
-                log.error("APPROVED message missing checksum — aborting for safety")
+                # Cannot verify integrity without a checksum — abort.
+                log.error("APPROVED message is missing 'checksum' — aborting for safety")
                 return
 
-            log.info(f"Download approved: {filename} ({format_bytes(expected_size)})")
+            log.info(
+                f"Download approved: {filename!r} "
+                f"({format_bytes(expected_size) if expected_size else 'unknown size'})"
+            )
 
-            # Step 3: Receive chunks and write to disk
+            # ── Step 4: Receive chunks and reassemble ─────────────────────────
             self._receive_file(client, filename, expected_size, expected_checksum)
 
-        except socket.timeout:
-            log.error(f"Connection timeout while downloading {filename}")
         except ConnectionError as e:
-            log.error(f"Connection error: {e}")
+            log.error(
+                f"Connection error with {host}:{port}: {e}. "
+                "Check that the peer's firewall allows inbound TCP on that port."
+            )
         except Exception as e:
             log.error(f"Download failed: {e}")
         finally:
             client.close()
 
-    def _receive_file(self, client: PeerClient, filename: str, expected_size: int, expected_checksum: str):
-        """Receive file in chunks with proper error handling."""
+    def _receive_file(
+        self,
+        client: PeerClient,
+        filename: str,
+        expected_size: int,
+        expected_checksum: str,
+    ):
+        """Receive chunked file data, reassemble, verify size and checksum."""
         output_path = DOWNLOADS_DIR / filename
 
-        # Tracks received chunks by index to detect gaps or out-of-order delivery
         received_chunks: dict[int, bytes] = {}
-        total_received = 0
+        total_received  = 0
         last_chunk_index = -1
 
         try:
             while True:
                 try:
                     message = client.receive()
-                except socket.timeout:
-                    log.error(f"Timeout waiting for next chunk (last received: {last_chunk_index})")
+                except ConnectionError as e:
+                    # PeerClient.receive() converts socket.timeout → ConnectionError,
+                    # so this single branch handles both timeouts and disconnects.
+                    log.error(
+                        f"Connection error waiting for chunk "
+                        f"(last chunk index: {last_chunk_index}): {e}"
+                    )
                     return
 
                 msg_type = message.get("type")
@@ -90,73 +115,76 @@ class DownloadService:
                     raw   = message.get("data")
 
                     if index is None or raw is None:
-                        # Malformed chunk — skip and keep going rather than crashing
-                        log.warning("Received malformed FILE_CHUNK (missing index or data), skipping")
+                        log.warn("Malformed FILE_CHUNK (missing index or data) — skipping")
                         continue
 
                     try:
-                        # Decode base64 back to original binary bytes
                         chunk_bytes = base64.b64decode(raw)
                         received_chunks[index] = chunk_bytes
-                        total_received += len(chunk_bytes)
-                        last_chunk_index = index
-                        log.debug(f"Received chunk {index} ({format_bytes(len(chunk_bytes))})")
+                        total_received   += len(chunk_bytes)
+                        last_chunk_index  = index
+
+                        # Progress log every 10 chunks to avoid log spam on large files
+                        if index % 10 == 0 or index == 0:
+                            progress = (
+                                f" [{total_received / expected_size * 100:.1f}%]"
+                                if expected_size else ""
+                            )
+                            log.debug(
+                                f"Chunk {index}: "
+                                f"{format_bytes(len(chunk_bytes))} received"
+                                f"{progress}"
+                            )
                     except Exception as e:
-                        log.warning(f"Failed to decode chunk {index}: {e}")
+                        log.warn(f"Failed to decode chunk {index}: {e}")
                         continue
 
                 elif msg_type == "TRANSFER_DONE":
-                    log.info("Transfer complete, reassembling file...")
-                    # All chunks received — now reassemble in correct order
+                    log.info(
+                        f"Transfer complete — {len(received_chunks)} chunk(s) received, "
+                        f"reassembling..."
+                    )
+
                     if not received_chunks:
-                        log.error("TRANSFER_DONE received but no chunks were collected")
+                        log.error("TRANSFER_DONE received but no chunks collected")
                         return
 
-                    # Sort by chunk index to reconstruct the file in the original order
-                    try:
-                        ordered_chunks = [received_chunks[i] for i in sorted(received_chunks)]
-                    except KeyError as e:
-                        log.error(f"Gap in chunk sequence: chunk {e} missing")
-                        return
-
-                    # Verify there are no gaps in chunk sequence
+                    # Verify there are no gaps in the chunk sequence
                     expected_indices = set(range(len(received_chunks)))
                     actual_indices   = set(received_chunks.keys())
 
                     if expected_indices != actual_indices:
-                        missing = expected_indices - actual_indices
-                        log.error(f"Missing chunks: {missing} — file may be corrupt")
+                        missing = sorted(expected_indices - actual_indices)
+                        log.error(f"Chunk sequence has gaps — missing: {missing}")
                         return
 
-                    log.info(f"Received {len(received_chunks)} chunks, writing to disk...")
-
-                    # Write assembled file to disk
+                    # Write assembled file in original order
                     with output_path.open("wb") as f:
-                        for chunk in ordered_chunks:
-                            f.write(chunk)
+                        for i in sorted(received_chunks):
+                            f.write(received_chunks[i])
 
-                    log.info(f"File written: {output_path}")
+                    log.info(f"File written to: {output_path}")
 
-                    # Verify file size matches expected
+                    # ── Verify size ───────────────────────────────────────────
                     actual_size = output_path.stat().st_size
-                    if actual_size != expected_size:
+                    if expected_size is not None and actual_size != expected_size:
                         log.error(
-                            f"Size mismatch for '{filename}' — "
-                            f"expected {format_bytes(expected_size)}, got {format_bytes(actual_size)}. "
-                            f"Deleting file."
+                            f"Size mismatch for {filename!r}: "
+                            f"expected {format_bytes(expected_size)}, "
+                            f"got {format_bytes(actual_size)} — deleting"
                         )
                         output_path.unlink(missing_ok=True)
                         return
 
-                    # Verify checksum against what the sender promised in APPROVED
-                    log.info("Verifying file integrity...")
+                    # ── Verify checksum ───────────────────────────────────────
+                    log.info("Verifying integrity (SHA-256)...")
                     actual_checksum = self._compute_checksum(output_path)
 
                     if actual_checksum != expected_checksum:
                         log.error(
-                            f"Checksum mismatch for '{filename}' — "
-                            f"expected {expected_checksum[:16]}..., got {actual_checksum[:16]}... "
-                            f"Deleting corrupt file."
+                            f"Checksum mismatch for {filename!r}: "
+                            f"expected {expected_checksum[:16]}..., "
+                            f"got {actual_checksum[:16]}... — deleting corrupt file"
                         )
                         output_path.unlink(missing_ok=True)
                         return
@@ -165,28 +193,16 @@ class DownloadService:
                     break
 
                 else:
-                    # Unknown message type mid-transfer — log but keep going
-                    log.warning(f"Unexpected message during transfer: {msg_type}")
+                    log.warn(f"Unexpected message type during transfer: {msg_type!r}")
 
         except Exception as e:
-            log.error(f"Error during transfer: {e}")
-            # Clean up partial file
+            log.error(f"Unexpected error during file receive: {e}")
             output_path.unlink(missing_ok=True)
 
     def _compute_checksum(self, file_path: Path) -> str:
-        """Compute SHA-256 checksum of file."""
-        # Must match the algorithm used in FileService._compute_checksum (sha256)
+        """SHA-256 checksum — must match algorithm used in FileService."""
         h = hashlib.sha256()
         with file_path.open("rb") as f:
             for chunk in iter(lambda: f.read(CHUNK_SIZE), b""):
                 h.update(chunk)
         return h.hexdigest()
-
-
-def format_bytes(bytes_size: int) -> str:
-    """Convert bytes to human-readable format."""
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if bytes_size < 1024:
-            return f"{bytes_size:.1f} {unit}"
-        bytes_size /= 1024
-    return f"{bytes_size:.1f} TB"
